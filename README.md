@@ -91,10 +91,3 @@ To debug Proton Pass CLI parsing without opening rofi:
 ```sh
 proton-pass-rofi --dump-items
 ```
-
-## Notes
-
-The script expects the JSON output exposed by `pass-cli vault list --output json`,
-`pass-cli item list --output json`, and `pass-cli item view --output json`.
-It also tolerates a configured default vault: if `vault list` is unavailable, it
-falls back to `pass-cli item list --output json`.
