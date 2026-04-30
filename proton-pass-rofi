@@ -1,0 +1,900 @@
+#!/usr/bin/env python3
+"""A rofi frontend for Proton Pass CLI."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+import webbrowser
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from typing import Any, Iterable
+
+
+DEFAULT_PASS_CLI = os.environ.get("PROTON_PASS_ROFI_PASS_CLI", "pass-cli")
+DEFAULT_ROFI = os.environ.get("PROTON_PASS_ROFI_ROFI", "rofi")
+DEFAULT_TERMINAL = os.environ.get("PROTON_PASS_ROFI_TERMINAL", "rofi-sensible-terminal")
+DEFAULT_CLIPBOARD_TIMEOUT = int(os.environ.get("PROTON_PASS_ROFI_CLEAR_SECONDS", "0"))
+DEFAULT_CACHE_ENABLED = os.environ.get("PROTON_PASS_ROFI_CACHE", "1") != "0"
+
+
+class ProtonPassRofiError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class Vault:
+    id: str
+    name: str
+
+
+@dataclass(frozen=True)
+class Item:
+    id: str
+    title: str
+    type: str
+    vault_id: str | None = None
+    vault_name: str | None = None
+    raw: dict[str, Any] | None = None
+    has_id: bool = True
+
+    @property
+    def uri(self) -> str | None:
+        if not self.has_id or not self.vault_id or not self.id:
+            return None
+        return f"pass://{self.vault_id}/{self.id}"
+
+
+@dataclass(frozen=True)
+class MenuEntry:
+    label: str
+    value: Any
+
+
+def run_capture(args: list[str], *, input_text: str | None = None) -> str:
+    process = subprocess.run(
+        args,
+        input=input_text,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if process.returncode != 0:
+        message = process.stderr.strip() or process.stdout.strip() or "command failed"
+        raise ProtonPassRofiError(f"{' '.join(args)}\n\n{message}")
+    return process.stdout.strip()
+
+
+def run_detached(args: list[str]) -> None:
+    subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+def parse_json(text: str) -> Any:
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ProtonPassRofiError(f"Expected JSON from pass-cli, got:\n\n{text}") from exc
+
+
+def as_list(data: Any, preferred_keys: Iterable[str]) -> list[Any]:
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        for key in preferred_keys:
+            value = data.get(key)
+            if isinstance(value, list):
+                return value
+        lists = [value for value in data.values() if isinstance(value, list)]
+        if len(lists) == 1:
+            return lists[0]
+    return []
+
+
+def scalar(data: dict[str, Any], *keys: str) -> str | None:
+    for key in keys:
+        value = data.get(key)
+        if isinstance(value, (str, int, float)) and str(value):
+            return str(value)
+    return None
+
+
+def nested_dict(data: dict[str, Any], *keys: str) -> dict[str, Any] | None:
+    current: Any = data
+    for key in keys:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return current if isinstance(current, dict) else None
+
+
+def nested_scalar(data: dict[str, Any], *keys: str) -> str | None:
+    if not keys:
+        return None
+    parent = nested_dict(data, *keys[:-1]) if len(keys) > 1 else data
+    if parent is None:
+        return None
+    return scalar(parent, keys[-1])
+
+
+def normalize_vault(raw: Any) -> Vault | None:
+    if not isinstance(raw, dict):
+        return None
+    vault_id = scalar(raw, "share_id", "shareId", "shareID", "id", "vault_id", "vaultId")
+    name = scalar(raw, "name", "title", "vault_name", "vaultName")
+    if not vault_id and not name:
+        return None
+    return Vault(id=vault_id or name or "", name=name or vault_id or "Unnamed vault")
+
+
+def normalize_item(raw: Any, vault: Vault | None = None) -> Item | None:
+    if not isinstance(raw, dict):
+        return None
+    item_id = scalar(raw, "item_id", "itemId", "itemID", "id")
+    title = (
+        scalar(raw, "title", "name", "item_title", "itemTitle")
+        or nested_scalar(raw, "content", "title")
+        or nested_scalar(raw, "item", "content", "title")
+    )
+    content_types = nested_dict(raw, "content", "content") or nested_dict(raw, "item", "content", "content")
+    item_type = scalar(raw, "type", "item_type", "itemType")
+    if not item_type and content_types:
+        item_type = next(iter(content_types.keys()), None)
+    item_type = item_type or "item"
+    vault_id = scalar(raw, "share_id", "shareId", "shareID", "vault_id", "vaultId")
+    vault_name = scalar(raw, "vault_name", "vaultName", "vault", "share_name", "shareName")
+    if vault:
+        vault_id = vault_id or vault.id
+        vault_name = vault_name or vault.name
+    if not item_id and not title:
+        return None
+    return Item(
+        id=item_id or title or "",
+        title=title or item_id or "Untitled",
+        type=item_type,
+        vault_id=vault_id,
+        vault_name=vault_name,
+        raw=raw,
+        has_id=bool(item_id),
+    )
+
+
+def cache_path() -> str:
+    cache_home = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
+    return os.path.join(cache_home, "proton-pass-rofi", "items.json")
+
+
+def item_cache_raw(item: Item) -> dict[str, Any] | None:
+    payload = item_list_payload(item)
+    safe_payload: dict[str, Any] = {}
+    for key in ("username", "email", "urls", "url"):
+        value = payload.get(key)
+        if isinstance(value, (str, int, float)):
+            safe_payload[key] = str(value)
+        elif isinstance(value, list):
+            safe_payload[key] = [
+                str(entry) for entry in value if isinstance(entry, (str, int, float)) and str(entry)
+            ]
+    if not safe_payload:
+        return None
+    return {"content": {"title": item.title, "content": {item.type: safe_payload}}}
+
+
+def item_to_cache(item: Item) -> dict[str, Any]:
+    return {
+        "id": item.id,
+        "title": item.title,
+        "type": item.type,
+        "vault_id": item.vault_id,
+        "vault_name": item.vault_name,
+        "raw": item_cache_raw(item),
+        "has_id": item.has_id,
+    }
+
+
+def item_from_cache(raw: Any) -> Item | None:
+    if not isinstance(raw, dict):
+        return None
+    item_id = scalar(raw, "id")
+    title = scalar(raw, "title")
+    if not item_id and not title:
+        return None
+    item_raw = raw.get("raw")
+    return Item(
+        id=item_id or title or "",
+        title=title or item_id or "Untitled",
+        type=scalar(raw, "type") or "item",
+        vault_id=scalar(raw, "vault_id"),
+        vault_name=scalar(raw, "vault_name"),
+        raw=item_raw if isinstance(item_raw, dict) else None,
+        has_id=bool(raw.get("has_id", True)),
+    )
+
+
+def read_cached_items() -> list[Item]:
+    path = cache_path()
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return []
+    cached_items = data.get("items") if isinstance(data, dict) else data
+    if isinstance(data, dict) and data.get("version") != 2:
+        return []
+    if not isinstance(cached_items, list):
+        return []
+    return [item for raw in cached_items if (item := item_from_cache(raw))]
+
+
+def write_cached_items(items: list[Item]) -> None:
+    path = cache_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as handle:
+        json.dump(
+            {
+                "version": 2,
+                "created_at": int(time.time()),
+                "items": [item_to_cache(item) for item in items],
+            },
+            handle,
+            separators=(",", ":"),
+        )
+    os.replace(tmp_path, path)
+
+
+def rofi(entries: list[MenuEntry], prompt: str, *, rofi_bin: str) -> Any | None:
+    if not entries:
+        return None
+    labels = [entry.label for entry in entries]
+    output = subprocess.run(
+        [rofi_bin, "-dmenu", "-i", "-p", prompt, "-format", "i"],
+        input="\n".join(labels),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if output.returncode != 0:
+        return None
+    selected = output.stdout.strip()
+    if not selected:
+        return None
+    try:
+        return entries[int(selected)].value
+    except (ValueError, IndexError):
+        return None
+
+
+def rofi_item_picker(entries: list[MenuEntry], *, rofi_bin: str) -> tuple[Any | None, str | None]:
+    if not entries:
+        return None, None
+    labels = [entry.label for entry in entries]
+    help_text = (
+        "Enter/Alt+3 type password | Alt+1 type login | Alt+2 type username | "
+        "Alt+u copy username | Alt+p/Alt+c copy password | Alt+t copy TOTP | "
+        "Alt+m menu | Alt+s refresh"
+    )
+    output = subprocess.run(
+        [
+            rofi_bin,
+            "-dmenu",
+            "-i",
+            "-no-custom",
+            "-p",
+            "Pass",
+            "-mesg",
+            help_text,
+            "-format",
+            "i",
+            "-kb-custom-4",
+            "Alt+u",
+            "-kb-custom-5",
+            "Alt+p,Alt+c",
+            "-kb-custom-6",
+            "Alt+t",
+            "-kb-custom-7",
+            "Alt+m",
+            "-kb-custom-8",
+            "Alt+s",
+        ],
+        input="\n".join(labels),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if output.returncode == 1:
+        return None, None
+    selected = output.stdout.strip()
+    if not selected:
+        return None, None
+    try:
+        value = entries[int(selected)].value
+    except (ValueError, IndexError):
+        return None, None
+    action_by_code = {
+        0: "type-password",
+        10: "type-login",
+        11: "type-username",
+        12: "type-password",
+        13: "copy-username",
+        14: "copy-password",
+        15: "copy-totp",
+        16: "menu",
+        17: "refresh",
+    }
+    return value, action_by_code.get(output.returncode)
+
+
+def rofi_message(message: str, *, rofi_bin: str) -> None:
+    subprocess.run([rofi_bin, "-e", message], check=False)
+
+
+def notify(message: str) -> None:
+    if shutil.which("notify-send"):
+        run_detached(["notify-send", "Proton Pass", message])
+
+
+def ensure_command(name: str, purpose: str) -> None:
+    if not shutil.which(name):
+        raise ProtonPassRofiError(f"Missing `{name}`; install it to {purpose}.")
+
+
+def run_in_terminal(command: list[str], terminal: str) -> None:
+    ensure_command(terminal, "run interactive pass-cli commands")
+    terminal_name = os.path.basename(terminal)
+    if terminal_name in {"gnome-terminal", "kgx"}:
+        run_detached([terminal, "--", *command])
+    elif terminal_name in {"konsole"}:
+        run_detached([terminal, "-e", *command])
+    else:
+        run_detached([terminal, "-e", *command])
+
+
+def list_vaults(pass_cli: str) -> list[Vault]:
+    data = parse_json(run_capture([pass_cli, "vault", "list", "--output", "json"]))
+    return [vault for raw in as_list(data, ("vaults", "shares", "data")) if (vault := normalize_vault(raw))]
+
+
+def list_items_for_vault(pass_cli: str, vault: Vault) -> list[Item]:
+    data = parse_json(
+        run_capture([pass_cli, "item", "list", "--share-id", vault.id, "--output", "json"])
+    )
+    return [
+        item
+        for raw in as_list(data, ("items", "data", "entries"))
+        if (item := normalize_item(raw, vault))
+    ]
+
+
+def list_default_items(pass_cli: str) -> list[Item]:
+    data = parse_json(run_capture([pass_cli, "item", "list", "--output", "json"]))
+    return [
+        item for raw in as_list(data, ("items", "data", "entries")) if (item := normalize_item(raw))
+    ]
+
+
+def list_items(pass_cli: str) -> list[Item]:
+    try:
+        vaults = list_vaults(pass_cli)
+    except ProtonPassRofiError:
+        return list_default_items(pass_cli)
+
+    items: list[Item] = []
+    errors: list[str] = []
+    with ThreadPoolExecutor(max_workers=min(8, max(1, len(vaults)))) as executor:
+        futures = {executor.submit(list_items_for_vault, pass_cli, vault): vault for vault in vaults}
+        for future in as_completed(futures):
+            try:
+                items.extend(future.result())
+            except ProtonPassRofiError as exc:
+                errors.append(str(exc))
+    if items:
+        return sorted(items, key=lambda item: ((item.vault_name or "").lower(), item.title.lower()))
+    if errors:
+        raise ProtonPassRofiError("\n\n".join(errors))
+    return []
+
+
+def list_items_cached(pass_cli: str, *, refresh: bool, use_cache: bool) -> list[Item]:
+    if use_cache and not refresh:
+        cached = read_cached_items()
+        if cached:
+            return cached
+    items = list_items(pass_cli)
+    if use_cache:
+        write_cached_items(items)
+    return items
+
+
+def item_ref_args(item: Item) -> list[str]:
+    if item.uri:
+        return [item.uri]
+    item_selector = ["--item-id", item.id] if item.has_id else ["--item-title", item.title]
+    if item.vault_id:
+        return ["--share-id", item.vault_id, *item_selector]
+    if item.vault_name:
+        return ["--vault-name", item.vault_name, *item_selector]
+    return item_selector
+
+
+def view_item(pass_cli: str, item: Item) -> dict[str, Any]:
+    output = run_capture([pass_cli, "item", "view", *item_ref_args(item), "--output", "json"])
+    data = parse_json(output)
+    if isinstance(data, dict):
+        return data
+    raise ProtonPassRofiError("pass-cli returned a non-object item view.")
+
+
+def first_login_payload(data: dict[str, Any]) -> dict[str, Any]:
+    content = (
+        nested_dict(data, "item", "content", "content")
+        or nested_dict(data, "content", "content")
+        or nested_dict(data, "Login")
+    )
+    if not content:
+        return {}
+    login = content.get("Login") if "Login" in content else content
+    return login if isinstance(login, dict) else {}
+
+
+def item_list_payload(item: Item) -> dict[str, Any]:
+    if not item.raw:
+        return {}
+    return first_login_payload(item.raw)
+
+
+def field_from_json(data: dict[str, Any], field: str) -> str | None:
+    login = first_login_payload(data)
+    field_map = {
+        "username": ("username", "item_username", "itemUsername"),
+        "email": ("email", "item_email", "itemEmail"),
+        "password": ("password",),
+        "totp": ("totp_uri", "totpUri", "totp"),
+    }
+    if field == "url":
+        urls = login.get("urls") or login.get("url")
+        if isinstance(urls, list):
+            values = [str(url) for url in urls if isinstance(url, (str, int, float)) and str(url)]
+            return "\n".join(values) if values else None
+        if isinstance(urls, (str, int, float)) and str(urls):
+            return str(urls)
+    if field == "note":
+        return nested_scalar(data, "item", "content", "note") or nested_scalar(data, "content", "note")
+    if field == "title":
+        return nested_scalar(data, "item", "content", "title") or nested_scalar(data, "content", "title")
+    for key in field_map.get(field, (field,)):
+        value = login.get(key)
+        if isinstance(value, (str, int, float)) and str(value):
+            return str(value)
+    return None
+
+
+def field_value(pass_cli: str, item: Item, field: str) -> str:
+    data = view_item(pass_cli, item)
+    value = field_from_json(data, field)
+    if value:
+        return value
+    output = run_capture([pass_cli, "item", "view", *item_ref_args(item), "--field", field])
+    return clean_secret_output(output)
+
+
+def totp_value(pass_cli: str, item: Item) -> str:
+    output = run_capture([pass_cli, "item", "totp", *item_ref_args(item)])
+    data = None
+    try:
+        data = json.loads(output)
+    except json.JSONDecodeError:
+        pass
+    if isinstance(data, dict):
+        for key in ("code", "totp", "value"):
+            value = scalar(data, key)
+            if value:
+                return value
+    return clean_secret_output(output).splitlines()[0]
+
+
+def clean_secret_output(output: str) -> str:
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    if not lines:
+        return ""
+    for line in lines:
+        if ":" in line:
+            possible = line.split(":", 1)[1].strip()
+            if possible:
+                return possible
+    if len(lines) == 1:
+        return lines[0]
+    return "\n".join(lines)
+
+
+def collect_scalar_fields(data: Any, prefix: str = "") -> list[tuple[str, str]]:
+    fields: list[tuple[str, str]] = []
+    if isinstance(data, dict):
+        for key, value in data.items():
+            label = f"{prefix}.{key}" if prefix else str(key)
+            if isinstance(value, (str, int, float, bool)) and str(value):
+                fields.append((label, str(value)))
+            elif isinstance(value, (dict, list)):
+                fields.extend(collect_scalar_fields(value, label))
+    elif isinstance(data, list):
+        for index, value in enumerate(data):
+            label = f"{prefix}[{index}]"
+            if isinstance(value, (str, int, float, bool)) and str(value):
+                fields.append((label, str(value)))
+            else:
+                fields.extend(collect_scalar_fields(value, label))
+    return fields
+
+
+def copy_to_clipboard(text: str, *, clear_after: int) -> None:
+    if not text and clear_after != 0:
+        raise ProtonPassRofiError("Nothing to copy.")
+    if shutil.which("wl-copy"):
+        run_capture(["wl-copy"], input_text=text)
+        if clear_after > 0:
+            run_detached([sys.executable, __file__, "--clear-clipboard", text, str(clear_after)])
+        return
+    if shutil.which("xclip"):
+        process = subprocess.Popen(
+            ["xclip", "-selection", "clipboard"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            start_new_session=True,
+        )
+        assert process.stdin is not None
+        process.stdin.write(text)
+        process.stdin.close()
+        if clear_after > 0:
+            run_detached([sys.executable, __file__, "--clear-clipboard", text, str(clear_after)])
+        return
+    if shutil.which("xsel"):
+        process = subprocess.Popen(
+            ["xsel", "--clipboard", "--input"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            start_new_session=True,
+        )
+        assert process.stdin is not None
+        process.stdin.write(text)
+        process.stdin.close()
+        if clear_after > 0:
+            run_detached([sys.executable, __file__, "--clear-clipboard", text, str(clear_after)])
+        return
+    raise ProtonPassRofiError("Missing wl-copy, xclip, or xsel for clipboard support.")
+
+
+def clear_clipboard(expected: str, delay: int) -> int:
+    time.sleep(delay)
+    current = ""
+    if shutil.which("wl-paste"):
+        current = subprocess.run(
+            ["wl-paste", "--no-newline"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        ).stdout
+    elif shutil.which("xclip"):
+        current = subprocess.run(
+            ["xclip", "-selection", "clipboard", "-out"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        ).stdout
+    elif shutil.which("xsel"):
+        current = subprocess.run(
+            ["xsel", "--clipboard", "--output"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        ).stdout
+    if current == expected:
+        if shutil.which("wl-copy"):
+            run_capture(["wl-copy"], input_text="")
+        elif shutil.which("xclip"):
+            run_capture(["xclip", "-selection", "clipboard"], input_text="")
+        elif shutil.which("xsel"):
+            run_capture(["xsel", "--clipboard", "--input"], input_text="")
+    return 0
+
+
+def type_text(text: str) -> None:
+    if not text:
+        raise ProtonPassRofiError("Nothing to type.")
+    if shutil.which("wtype"):
+        run_capture(["wtype", text])
+    elif shutil.which("xdotool"):
+        run_capture(["xdotool", "type", "--clearmodifiers", "--", text])
+    else:
+        raise ProtonPassRofiError("Missing wtype or xdotool for typing support.")
+
+
+def generate_password(pass_cli: str, rofi_bin: str, clear_after: int) -> None:
+    choices = [
+        MenuEntry("Random password", ["password", "generate", "random"]),
+        MenuEntry("Passphrase", ["password", "generate", "passphrase"]),
+    ]
+    args = rofi(choices, "Generate", rofi_bin=rofi_bin)
+    if args is None:
+        return
+    value = clean_secret_output(run_capture([pass_cli, *args]))
+    copy_to_clipboard(value, clear_after=clear_after)
+    notify("Generated secret copied")
+
+
+def open_item_url(pass_cli: str, item: Item) -> None:
+    url = field_value(pass_cli, item, "url")
+    if not url:
+        raise ProtonPassRofiError("Item has no URL field.")
+    webbrowser.open(url.splitlines()[0])
+
+
+def choose_custom_field(pass_cli: str, item: Item, rofi_bin: str) -> tuple[str, str] | None:
+    data = view_item(pass_cli, item)
+    blocked = {
+        "id",
+        "item_id",
+        "itemId",
+        "title",
+        "name",
+        "type",
+        "share_id",
+        "shareId",
+        "vault_id",
+        "vaultId",
+        "vault_name",
+        "vaultName",
+    }
+    entries = [
+        MenuEntry(f"{name}: {value}", (name, value))
+        for name, value in collect_scalar_fields(data)
+        if name.split(".")[-1] not in blocked
+    ]
+    return rofi(entries, "Field", rofi_bin=rofi_bin)
+
+
+def item_label(item: Item) -> str:
+    payload = item_list_payload(item)
+    username = scalar(payload, "username", "email")
+    urls = payload.get("urls") or payload.get("url")
+    url = None
+    if isinstance(urls, list):
+        url = next((str(value) for value in urls if isinstance(value, (str, int, float)) and str(value)), None)
+    elif isinstance(urls, (str, int, float)) and str(urls):
+        url = str(urls)
+
+    parts = [item.title]
+    if username:
+        parts.append(username)
+    if url and url != username and url != item.title:
+        parts.append(url)
+    if item.vault_name:
+        parts.append(f"[{item.vault_name}]")
+    if item.type:
+        parts.append(f"({item.type})")
+    return " - ".join(parts)
+
+
+def handle_item_action(pass_cli: str, rofi_bin: str, item: Item, clear_after: int) -> None:
+    action = rofi(
+        [
+            MenuEntry("Copy password", "copy-password"),
+            MenuEntry("Copy username", "copy-username"),
+            MenuEntry("Copy email", "copy-email"),
+            MenuEntry("Copy TOTP", "copy-totp"),
+            MenuEntry("Copy URL", "copy-url"),
+            MenuEntry("Copy note", "copy-note"),
+            MenuEntry("Copy custom field", "copy-custom"),
+            MenuEntry("Type username", "type-username"),
+            MenuEntry("Type password", "type-password"),
+            MenuEntry("Type username, tab, password", "type-login"),
+            MenuEntry("Open URL", "open-url"),
+            MenuEntry("View item JSON", "view-json"),
+        ],
+        item.title,
+        rofi_bin=rofi_bin,
+    )
+    if action is None:
+        return
+
+    if action.startswith("copy-") and action not in {"copy-totp", "copy-custom"}:
+        field = action.removeprefix("copy-")
+        copy_to_clipboard(field_value(pass_cli, item, field), clear_after=clear_after)
+        notify(f"{field} copied")
+    elif action == "copy-totp":
+        copy_to_clipboard(totp_value(pass_cli, item), clear_after=clear_after)
+        notify("TOTP copied")
+    elif action == "copy-custom":
+        selected = choose_custom_field(pass_cli, item, rofi_bin)
+        if selected:
+            name, value = selected
+            copy_to_clipboard(value, clear_after=clear_after)
+            notify(f"{name} copied")
+    elif action == "type-username":
+        type_text(field_value(pass_cli, item, "username"))
+    elif action == "type-password":
+        type_text(field_value(pass_cli, item, "password"))
+    elif action == "type-login":
+        type_text(field_value(pass_cli, item, "username"))
+        if shutil.which("xdotool"):
+            run_capture(["xdotool", "key", "Tab"])
+        else:
+            type_text("\t")
+        type_text(field_value(pass_cli, item, "password"))
+    elif action == "open-url":
+        open_item_url(pass_cli, item)
+    elif action == "view-json":
+        pretty = json.dumps(view_item(pass_cli, item), indent=2, sort_keys=True)
+        rofi_message(pretty, rofi_bin=rofi_bin)
+
+
+def perform_item_action(pass_cli: str, rofi_bin: str, item: Item, action: str, clear_after: int) -> bool:
+    if action == "menu":
+        handle_item_action(pass_cli, rofi_bin, item, clear_after)
+    elif action == "copy-password":
+        copy_to_clipboard(field_value(pass_cli, item, "password"), clear_after=clear_after)
+        notify("password copied")
+    elif action == "copy-username":
+        copy_to_clipboard(field_value(pass_cli, item, "username"), clear_after=clear_after)
+        notify("username copied")
+    elif action == "copy-totp":
+        copy_to_clipboard(totp_value(pass_cli, item), clear_after=clear_after)
+        notify("TOTP copied")
+    elif action == "type-username":
+        type_text(field_value(pass_cli, item, "username"))
+    elif action == "type-password":
+        type_text(field_value(pass_cli, item, "password"))
+    elif action == "type-login":
+        type_text(field_value(pass_cli, item, "username"))
+        if shutil.which("xdotool"):
+            run_capture(["xdotool", "key", "Tab"])
+        else:
+            type_text("\t")
+        type_text(field_value(pass_cli, item, "password"))
+        try:
+            copy_to_clipboard(totp_value(pass_cli, item), clear_after=clear_after)
+            notify("TOTP copied")
+        except ProtonPassRofiError:
+            pass
+    elif action == "refresh":
+        return True
+    return False
+
+
+def run_app(
+    pass_cli: str,
+    rofi_bin: str,
+    terminal: str,
+    clear_after: int,
+    *,
+    refresh_cache: bool = False,
+    use_cache: bool = True,
+) -> int:
+    ensure_command(pass_cli, "talk to Proton Pass")
+    ensure_command(rofi_bin, "show menus")
+
+    items = list_items_cached(pass_cli, refresh=refresh_cache, use_cache=use_cache)
+    selected, action = rofi_item_picker(
+        [MenuEntry(item_label(item), item) for item in items]
+        + [
+            MenuEntry("Generate password", "generate"),
+            MenuEntry("Login", "login"),
+            MenuEntry("Logout", "logout"),
+        ],
+        rofi_bin=rofi_bin,
+    )
+    if selected is None:
+        return 0
+    if selected == "generate":
+        generate_password(pass_cli, rofi_bin, clear_after)
+        return 0
+    if selected == "login":
+        run_in_terminal([pass_cli, "login"], terminal)
+        return 0
+    if selected == "logout":
+        run_in_terminal([pass_cli, "logout"], terminal)
+        return 0
+    if isinstance(selected, Item):
+        if perform_item_action(pass_cli, rofi_bin, selected, action or "type-password", clear_after):
+            return run_app(
+                pass_cli,
+                rofi_bin,
+                terminal,
+                clear_after,
+                refresh_cache=True,
+                use_cache=use_cache,
+            )
+    return 0
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="rofi frontend for Proton Pass CLI")
+    parser.add_argument("--pass-cli", default=DEFAULT_PASS_CLI, help="pass-cli executable")
+    parser.add_argument("--rofi", default=DEFAULT_ROFI, help="rofi executable")
+    parser.add_argument("--terminal", default=DEFAULT_TERMINAL, help="terminal for login/logout")
+    parser.add_argument(
+        "--clear-seconds",
+        default=DEFAULT_CLIPBOARD_TIMEOUT,
+        type=int,
+        help="clear clipboard after this many seconds; set 0 to disable",
+    )
+    parser.add_argument(
+        "--dump-items",
+        action="store_true",
+        help="print normalized items as JSON and exit; useful for debugging pass-cli output",
+    )
+    parser.add_argument(
+        "--refresh-cache",
+        action="store_true",
+        help="refresh cached item metadata before showing the launcher",
+    )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="disable cached item metadata",
+    )
+    parser.add_argument("--clear-clipboard", nargs=2, metavar=("VALUE", "SECONDS"), help=argparse.SUPPRESS)
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv or sys.argv[1:])
+    if args.clear_clipboard:
+        return clear_clipboard(args.clear_clipboard[0], int(args.clear_clipboard[1]))
+    try:
+        use_cache = DEFAULT_CACHE_ENABLED and not args.no_cache
+        if args.dump_items:
+            print(
+                json.dumps(
+                    [
+                        {
+                            "id": item.id,
+                            "title": item.title,
+                            "type": item.type,
+                            "vault_id": item.vault_id,
+                            "vault_name": item.vault_name,
+                            "has_id": item.has_id,
+                            "uri": item.uri,
+                        }
+                        for item in list_items_cached(
+                            args.pass_cli,
+                            refresh=args.refresh_cache,
+                            use_cache=use_cache,
+                        )
+                    ],
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 0
+        return run_app(
+            args.pass_cli,
+            args.rofi,
+            args.terminal,
+            args.clear_seconds,
+            refresh_cache=args.refresh_cache,
+            use_cache=use_cache,
+        )
+    except ProtonPassRofiError as exc:
+        if shutil.which(args.rofi):
+            rofi_message(str(exc), rofi_bin=args.rofi)
+        else:
+            print(exc, file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
