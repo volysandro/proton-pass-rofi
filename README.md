@@ -46,9 +46,9 @@ types the selected password and exits.
 
 Default item-list keybindings match `rofi-rbw`:
 
-- `Enter` / `Alt+3`: type password
-- `Alt+1`: type username, tab, password, and copy TOTP if available
-- `Alt+2`: type username
+- `Enter`: type login
+- `Alt+1`: type username
+- `Alt+2`: type password
 - `Alt+u`: copy username
 - `Alt+p` / `Alt+c`: copy password
 - `Alt+t`: copy TOTP
