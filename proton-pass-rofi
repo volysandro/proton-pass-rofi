@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import os
 import shutil
@@ -276,9 +277,14 @@ def rofi_item_picker(entries: list[MenuEntry], *, rofi_bin: str) -> tuple[Any | 
         return None, None
     labels = [entry.label for entry in entries]
     help_text = (
-        "Enter/Alt+3 type password | Alt+1 type login | Alt+2 type username | "
-        "Alt+u copy username | Alt+p/Alt+c copy password | Alt+t copy TOTP | "
-        "Alt+m menu | Alt+s refresh"
+        "<b>Enter</b> type login  "
+        "<b>Alt+1</b> type username  "
+        "<b>Alt+2</b> type password\n"
+        "<b>Alt+u</b> copy username  "
+        "<b>Alt+p</b>/<b>Alt+c</b> copy password  "
+        "<b>Alt+t</b> copy TOTP  "
+        "<b>Alt+m</b> menu  "
+        "<b>Alt+s</b> refresh"
     )
     output = subprocess.run(
         [
@@ -286,6 +292,7 @@ def rofi_item_picker(entries: list[MenuEntry], *, rofi_bin: str) -> tuple[Any | 
             "-dmenu",
             "-i",
             "-no-custom",
+            "-markup-rows",
             "-p",
             "Pass",
             "-mesg",
@@ -319,9 +326,9 @@ def rofi_item_picker(entries: list[MenuEntry], *, rofi_bin: str) -> tuple[Any | 
     except (ValueError, IndexError):
         return None, None
     action_by_code = {
-        0: "type-password",
-        10: "type-login",
-        11: "type-username",
+        0: "type-login",
+        10: "type-username",
+        11: "type-password",
         12: "type-password",
         13: "copy-username",
         14: "copy-password",
@@ -676,16 +683,16 @@ def item_label(item: Item) -> str:
     elif isinstance(urls, (str, int, float)) and str(urls):
         url = str(urls)
 
-    parts = [item.title]
+    parts: list[str] = [f"<b>{html.escape(item.title)}</b>"]
     if username:
-        parts.append(username)
+        parts.append(f"<span alpha='55%'>{html.escape(username)}</span>")
     if url and url != username and url != item.title:
-        parts.append(url)
+        parts.append(f"<span alpha='55%'>{html.escape(url)}</span>")
     if item.vault_name:
-        parts.append(f"[{item.vault_name}]")
+        parts.append(f"<span alpha='40%'>[{html.escape(item.vault_name)}]</span>")
     if item.type:
-        parts.append(f"({item.type})")
-    return " - ".join(parts)
+        parts.append(f"<span alpha='40%'>({html.escape(item.type)})</span>")
+    return "  ·  ".join(parts)
 
 
 def handle_item_action(pass_cli: str, rofi_bin: str, item: Item, clear_after: int) -> None:
@@ -808,7 +815,7 @@ def run_app(
         run_in_terminal([pass_cli, "logout"], terminal)
         return 0
     if isinstance(selected, Item):
-        if perform_item_action(pass_cli, rofi_bin, selected, action or "type-password", clear_after):
+        if perform_item_action(pass_cli, rofi_bin, selected, action or "type-login", clear_after):
             return run_app(
                 pass_cli,
                 rofi_bin,
